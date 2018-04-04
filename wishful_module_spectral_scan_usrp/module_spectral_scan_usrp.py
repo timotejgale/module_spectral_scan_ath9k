@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import logging
 import random
@@ -8,132 +9,60 @@ import queue
 import numpy as np
 import threading
 import warnings
-from .csi import receiver as csi_receiver
-from .psd import scanner as psd_scanner
-from .psd import helper as psd_helper
-#from .psd import plotter as psd_plotter
-
-
-__author__ = "M. Olbrich"
-__copyright__ = "Copyright (c) 2016, Technische Universität Berlin"
-__version__ = "0.1.0"
+import subprocess
+from itertools import islice
 
 
 @wishful_module.build_module
-class SpectralScanAth9kModule(wishful_module.AgentModule):
+class SpectralScanUsrpModule(wishful_module.AgentModule):
     def __init__(self):
-        super(SpectralScanAth9kModule, self).__init__()
+        super(SpectralScanUsrpModule, self).__init__()
 
         self.log = logging.getLogger('wifi_module.main')
         self.bgd_thread = threading.Thread()
         self.bgd_run = False
-        self.bgd_recvq = queue.Queue(maxsize=0)
         self.bgd_sendq = queue.Queue(maxsize=0)
-        self.iface = 'wlan0'
-        self.scan_mode = None
-        self.ival = None
-
-
-    @wishful_module.bind_function(upis.radio.receive_csi)
-    def receive_csi(self):
-        self.log.debug("Simple Module receives CSI on interface: {}".format(self.interface))
-
-        # define CSI device
-        csi_dev = '/dev/CSI_dev'
-
-        # check CSI device
-        if not os.path.exists(csi_dev):
-            raise ValueError('Could not find CSI device: %s.' % csi_dev)
-
-        # receive CSI
-        csi = csi_receiver.scan(csi_dev=csi_dev, debug=True)
-
-        return csi
-
-
-    def psd_bgd_fun_mock(self):
-        print("psd_bgd_fun_mock(): Entering.")
-
-        while self.bgd_run:
-            print("psd_bgd_fun_mock(): Looping with ival=%d" % self.ival)
-
-            # collect all samples of last scan interval from recvq
-            qsize = random.randint(8, 1024)
-            recvq_pkts = np.full((56, qsize), (np.nan), dtype=np.float64)
-            print("psd_bgd_fun_mock(): Getting %d pkts from recvq." % qsize)
-
-            for i in range(0, qsize, 1):
-                recvq_pkts[:,i] = -120*np.random.rand(56)
-
-            # calculate statistics for last scan interval
-            recvq_pkts_avg = 10*np.log10(np.mean(10**np.divide(recvq_pkts, 10), axis=1))
-            #env = np.max(ret, axis=1)
-
-            # upload statistics for last scan interval
-            self.bgd_sendq.put(recvq_pkts_avg)
-            print("psd_bgd_fun_mock(): Adding pkt to sendq. New sendq queue size: %d." % self.bgd_sendq.qsize())
-
-            time.sleep(self.ival)
-
 
     def psd_bgd_fun(self):
         print("psd_bgd_fun(): Entering.")
-        debug = False
 
-        while self.bgd_run:
-            print("psd_bgd_fun(): Looping with ival=%d." % self.ival)
+        base_usrp_path = "%s/usrpse" % os.path.dirname(os.path.abspath(__file__))
+        scanner_command = "%s/usrpse_sweeping" % base_usrp_path
+        uhd_find_command = "%s/uhd_find_devices" % base_usrp_path
 
-            if (self.scan_mode == 'manual'):
-                psd_helper.scan_dev_start(self.iface)
+        p = subprocess.Popen(uhd_find_command, stdout=subprocess.PIPE, shell=True)
+        (output, err) = p.communicate()
+        p_status = p.wait()
+        if p_status > 0:
+            raise RuntimeError("Can't find USRP's IP address.")
 
-            psd_scanner.scan(self.iface, self.bgd_recvq, debug)
+        # python uhd library is not used due to its limitations
+        try:
+            usrp_ip_line = list(filter(lambda x:"addr:" in x, output.decode(sys.stdout.encoding).split("\n")))[0]
+            usrp_ip = usrp_ip_line.strip().split(" ")[1]
+            usrp_ip_arg = "addr=%s" % usrp_ip
+        except:
+            raise RuntimeError("Can't find USRP's IP address.")
 
-            # determine size of recvq
-            qsize = self.bgd_recvq.qsize()
-
-            # calculate statistics for last scan interval and upload
-            if (qsize > 0):
-
-                # collect all samples of last scan interval from recvq
-                recvq_pkts = np.full((56, qsize), (np.nan), dtype=np.float64)
-                print("psd_bgd_fun(): Getting %d pkts from recvq." % qsize)
-
-                for i in range(0, qsize, 1):
-                    psd_pkt = self.bgd_recvq.get()
-                    recvq_pkts[:,i] = psd_pkt['psd_vector']
-
-                # calculate aggregate metric(s)
-                recvq_pkts_avg = 10*np.log10(np.mean(10**np.divide(recvq_pkts, 10), axis=1))
-                #recvq_pkts_env = np.max(recvq_pkts, axis=1)
-
-                # upload aggregate metric(s) for last scan interval
-                self.bgd_sendq.put(recvq_pkts_avg)
-                print("psd_bgd_fun(): Adding pkt to sendq. New sendq queue size: %d." % self.bgd_sendq.qsize())
-
-            time.sleep(self.ival)
+        args = (scanner_command, "--gain", self.gain, "--spb", self.spb, "--fftsize", self.fftsize,\
+                 "--numofchannel", self.numofchannel, "--firstchannel", self.firstchannel,\
+                 "--channelwidth", self.channelwidth, "--channeloffset", self.channeloffset,\
+                 "--args", usrp_ip_arg, "--bps", self.bps, "--freqbegin", self.freqbegin, "--mode", self.mode)
+        p = subprocess.Popen(args, stdout=subprocess.PIPE)
+        while True:
+            psd_iter = iter(lambda: p.stdout.readline(), b'')
+            for psd in islice(psd_iter, 40, None): # number of info lines at the beginning
+                s_psd = psd.decode(sys.stdout.encoding).strip().split(",")
+                print(s_psd)
+                self.bgd_sendq.put(s_psd)
+                p.stdout.flush()
+                if not self.bgd_run:
+                    break
 
 
-    def psd_bgd_start(self, count=8, period=255, fft_period=15, short_repeat=1):
+    def psd_bgd_start(self):
         print("psd_bgd_start(): Entering.")
 
-        # disable scan device and drain its queue
-        psd_helper.scan_dev_stop(self.iface)
-        psd_helper.scan_dev_drain(self.iface)
-
-        # configure scan device
-        psd_helper.scan_dev_configure(
-            iface=self.iface,
-            mode=self.scan_mode,
-            count=count,
-            period=period,
-            fft_period=fft_period,
-            short_repeat=short_repeat
-        )
-
-        if (self.scan_mode == 'background'):
-            psd_helper.scan_dev_start(self.iface)
-
-        # start background daemon
         self.bgd_run = True
         self.bgd_thread = threading.Thread(target=self.psd_bgd_fun)
         self.bgd_thread.daemon = True
@@ -151,22 +80,15 @@ class SpectralScanAth9kModule(wishful_module.AgentModule):
         self.bgd_run = False
         self.bgd_thread.join()
 
-        # disable scan device and drain its queue
-        psd_helper.scan_dev_stop(self.iface)
-        psd_helper.scan_dev_drain(self.iface)
-
-
     @wishful_module.bind_function(upis.radio.scand_start)
-    def scand_start(self, iface='wlan0', mode='background', ival=1):
+    def scand_start(self, iface="eno2", gain="30", spb="4194304", fftsize="1024",\
+                     numofchannel="13", firstchannel="2412000000", channelwidth="20000000",\
+                     channeloffset="5000000", bps="4", freqbegin="2410000000", mode="2"):
         print("scand_start(): Entering.")
 
         if self.bgd_thread.is_alive():
             warnings.warn('Scanner daemon already running.', RuntimeWarning, stacklevel=2)
             return
-
-        # drain receive queue
-        while not self.bgd_recvq.empty():
-            self.bgd_recvq.get()
 
         # drain send queue
         while not self.bgd_sendq.empty():
@@ -174,12 +96,19 @@ class SpectralScanAth9kModule(wishful_module.AgentModule):
 
         # set scanning params
         self.iface = iface
-        self.scan_mode = mode
-        self.ival = ival
+        self.gain = gain
+        self.spb = spb
+        self.fftsize = fftsize
+        self.numofchannel = numofchannel
+        self.firstchannel = firstchannel
+        self.channelwidth = channelwidth
+        self.channeloffset = channeloffset
+        self.bps = bps
+        self.freqbegin = freqbegin
+        self.mode = mode
 
         # start backgound daemon
-        if (self.scan_mode == 'background') or (self.scan_mode == 'manual'):
-            self.psd_bgd_start()
+        self.psd_bgd_start()
 
 
     @wishful_module.bind_function(upis.radio.scand_stop)
@@ -187,12 +116,7 @@ class SpectralScanAth9kModule(wishful_module.AgentModule):
         print("scand_stop(): Entering.")
 
         # stop backgound daemon
-        if (self.scan_mode == 'background') or (self.scan_mode == 'manual'):
-            self.psd_bgd_stop()
-
-        # drain receive queue
-        while not self.bgd_recvq.empty():
-            self.bgd_recvq.get()
+        self.psd_bgd_stop()
 
         # drain send queue
         while not self.bgd_sendq.empty():
@@ -200,16 +124,14 @@ class SpectralScanAth9kModule(wishful_module.AgentModule):
 
 
     @wishful_module.bind_function(upis.radio.scand_reconf)
-    def scand_reconf(self, iface='wlan0', mode='background', ival=1):
+    def scand_reconf(self, iface="eno2", gain="30", spb="4194304", fftsize="1024",\
+                      numofchannel="13", firstchannel="2412000000", channelwidth="20000000",\
+                      channeloffset="5000000", bps="4", freqbegin="2410000000", mode="2"):
         print("scand_reconf(): Entering.")
 
         # stop backgound daemon
         if self.bgd_thread.is_alive():
             self.psd_bgd_stop()
-
-        # drain receive queue
-        while not self.bgd_recvq.empty():
-            self.bgd_recvq.get()
 
         # drain send queue
         while not self.bgd_sendq.empty():
@@ -217,8 +139,16 @@ class SpectralScanAth9kModule(wishful_module.AgentModule):
 
         # update scanning params
         self.iface = iface
-        self.scan_mode = mode
-        self.ival = ival
+        self.gain = gain
+        self.spb = spb
+        self.fftsize = fftsize
+        self.numofchannel = numofchannel
+        self.firstchannel = firstchannel
+        self.channelwidth = channelwidth
+        self.channeloffset = channeloffset
+        self.bps = bps
+        self.freqbegin = freqbegin
+        self.mode = mode
 
         # start backgound daemon again
         self.psd_bgd_start()
@@ -232,11 +162,13 @@ class SpectralScanAth9kModule(wishful_module.AgentModule):
         print("scand_read(): Current send queue size: %d." % qsize)
 
         if (qsize > 0):
-            ret = np.full((56, qsize), (np.nan), dtype=np.float64)
-            for i in range(0, qsize, 1):
-                psd_pkt = self.bgd_sendq.get()
-                ret[:,i] = psd_pkt
+            first_psd = self.bgd_sendq.get()
+            ret = np.full((qsize, len(first_psd)), (np.nan), dtype=np.int64)
+            ret[0, :] = first_psd
+            for i in range(1, qsize):
+                psd = self.bgd_sendq.get()
+                ret[i, :] = psd
         else:
-            ret = np.full((0), (np.nan), dtype=np.float64)
+            ret = np.full((0), (np.nan), dtype=np.int64)
 
         return ret
